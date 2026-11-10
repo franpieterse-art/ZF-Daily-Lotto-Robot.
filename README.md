@@ -1,14 +1,22 @@
-# ZF Daily Lotto Robot V2
+# ZF Daily Lotto Robot V3 — Audit and Learning History
 
-## GitHub / Render
-Upload the CONTENTS of this folder to the ROOT of a new or existing GitHub repository.
-Render Python web service: Build command `pip install -r requirements.txt`; Start command `gunicorn server:app`.
-In Render > Environment add `RESULTSZA_API_KEY` using a key you obtain from https://resultsza.co.za/api_docs . Do not paste API keys into GitHub.
-Optional: set `DATA_DIR=/var/data` and attach a persistent Render disk mounted at `/var/data` on a plan that supports disks. Without it, historical results and learning weights can be lost on restart/deploy.
+## Deployment
+Upload the files in this folder to the ROOT of your GitHub repository.
+Build: `pip install -r requirements.txt`
+Start: `gunicorn server:app --timeout 120`
+Set `DATA_DIR` to a writable persistent disk mount path (e.g. `/var/data`). Do not set `/var/data` unless a Render persistent disk is actually mounted there. On an ephemeral Render service, omit `DATA_DIR` (data will be lost on redeploy).
+Optional `RESULTSZA_API_KEY` enables provider sync, subject to provider API validity and limits. CSV import remains available.
 
-## How it works
-Sync ResultsZA: choose start and end dates (max 61 days per request). Each day uses an API request unless previously saved. API plans may limit requests; the app does not include or bypass a provider key. A 404 for a day is skipped; other provider errors are reported. For a long archive, sync consecutive 61-day ranges or import a CSV (`date,n1,n2,n3,n4,n5` or `date,winning_numbers`).
-Predict: requires 30 earlier draws. Produces five research rows of six numbers. The actual Daily Lotto draw is FIVE numbers; research rows are not valid standard tickets.
-Reveal: compares to a stored result or requests the selected date from ResultsZA. Learn: tests weight variations on chronologically split history, and promotes only if the challenger improves on a later holdout. Training/holdout testing alone does not establish predictive power; repeated selection on the holdout risks overfitting.
+## New V3 features
+- SQLite audit of every prediction, six-number rows, date, time, attempt, strategy weights, blind/post-reveal status.
+- Reveal uses the stored prediction ID rather than trusting editable rows sent from browser.
+- History records actual results, best row, mean matches, unique coverage.
+- Learn stores baseline/challenger weights, holdout performance, promotion decision, timestamp.
+- Smaller 30-draw learning batches to reduce synchronous request timeout. 20 training and 10 holdout draws, with 60 warmup draws; these are exploratory and statistically weak.
+- `/api/history` provides audit data; `/api/history.csv` exports prediction audit.
 
-No official lottery affiliation. Results from third-party services should be verified against official results. Random lottery outcomes cannot be forecast reliably by historical frequency, gaps, or machine learning.
+## Important limitations
+Historical prediction results are reproducible but do not demonstrate any predictive edge over random lottery draws. Repeated learning against the same holdout leads to overfitting. For robust validation, evaluate a genuinely untouched later time period and compare with random baseline. The app does not auto-sync without a valid provider key. Render ephemeral files are not durable.
+
+## Verification
+Python syntax and JavaScript syntax checked. Full Flask runtime integration not tested in this environment.

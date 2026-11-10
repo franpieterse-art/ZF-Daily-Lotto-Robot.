@@ -1,7 +1,17 @@
-import os,csv,io,json,random,hashlib,urllib.request,urllib.parse,urllib.error,datetime,collections,math,re,time
+import os,csv,io,json,random,hashlib,urllib.request,urllib.parse,urllib.error,datetime,collections,math,re,time,sqlite3,uuid,threading
 from flask import Flask,request,jsonify,send_file
 app=Flask(__name__)
 DATA=os.path.join(os.environ.get('DATA_DIR','.'),'daily_history.json'); STATE=os.path.join(os.environ.get('DATA_DIR','.'),'learning.json'); os.makedirs(os.path.dirname(os.path.abspath(DATA)),exist_ok=True)
+DB=os.path.join(os.environ.get('DATA_DIR','.'),'learning_history.sqlite3')
+def connect():
+ c=sqlite3.connect(DB,timeout=15);c.row_factory=sqlite3.Row;c.execute('PRAGMA busy_timeout=15000');return c
+def initdb():
+ with connect() as c:
+  c.execute('CREATE TABLE IF NOT EXISTS predictions (id TEXT PRIMARY KEY, draw_date TEXT, created_at TEXT, attempt INTEGER, rows_json TEXT, weights_json TEXT, status TEXT, draws_before INTEGER, result_json TEXT, best INTEGER, average REAL, coverage INTEGER)')
+  c.execute('CREATE TABLE IF NOT EXISTS learning_runs (id TEXT PRIMARY KEY, created_at TEXT, training_count INTEGER, holdout_count INTEGER, baseline_json TEXT, challenger_json TEXT, old_weights_json TEXT, candidate_weights_json TEXT, promoted INTEGER, reason TEXT)')
+initdb()
+def utcnow():return datetime.datetime.now(datetime.timezone.utc).isoformat()
+def rowdict(r):return dict(r) if r else None
 def load(path,default):
  try:
   with open(path) as f:return json.load(f)
@@ -103,42 +113,71 @@ def imp():
  h=history();h.update(parsed);save(DATA,h);return jsonify(imported=len(parsed),total=len(h))
 @app.post('/api/predict')
 def pred():
- date=request.json.get('date','');attempt=int(request.json.get('attempt',0))
- if not 0<=attempt<=10000:return jsonify(error='Invalid attempt'),400
+ body=request.get_json(silent=True) or {};date=body.get('date','')
  try:
-  datetime.date.fromisoformat(date);rows=predict(date,attempt=attempt);return jsonify(date=date,rows=rows,attempt=attempt,draws_before=sum(d<date for d in history()),mode='blind' if attempt==0 else 'alternative blind candidate; valid only if generated before reveal')
- except Exception as e:return jsonify(error=str(e)),400
+  datetime.date.fromisoformat(date)
+  attempt=int(body.get('attempt',0))
+  if not 0<=attempt<=10000:raise ValueError('Invalid attempt')
+  h=history();w=weights();rows=predict(date,h,w,attempt)
+  with connect() as c:
+   prior=c.execute('SELECT 1 FROM predictions WHERE draw_date=? AND status="revealed" LIMIT 1',(date,)).fetchone()
+   status='post_reveal' if prior else 'blind'
+   pid=str(uuid.uuid4());c.execute('INSERT INTO predictions (id,draw_date,created_at,attempt,rows_json,weights_json,status,draws_before) VALUES (?,?,?,?,?,?,?,?)',(pid,date,utcnow(),attempt,json.dumps(rows),json.dumps(w),status,sum(d<date for d in h)))
+  return jsonify(id=pid,date=date,rows=rows,attempt=attempt,draws_before=sum(d<date for d in h),mode=status)
+ except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 @app.post('/api/reveal')
 def reveal():
- d=request.json['date'];rows=request.json['rows'];h=history();actual=h.get(d)
- if len(rows)!=5 or any(len(r)!=6 or len(set(r))!=6 or any(not isinstance(n,int) or not 1<=n<=36 for n in r) for r in rows):return jsonify(error='Invalid prediction rows'),400
+ body=request.get_json(silent=True) or {};pid=body.get('id')
+ with connect() as c:r=c.execute('SELECT * FROM predictions WHERE id=?',(pid,)).fetchone()
+ if not r:return jsonify(error='Prediction ID not found. Generate predictions first.'),404
+ d=r['draw_date'];rows=json.loads(r['rows_json']);h=history();actual=h.get(d)
  if not actual and os.environ.get('RESULTSZA_API_KEY'):
   try:
    actual=fetch_draw(d)
    if actual:h[d]=actual;save(DATA,h)
   except ValueError as e:return jsonify(error=str(e)),502
- if not actual:return jsonify(error='No verified result for this date in the archive. Sync or import results, or configure RESULTSZA_API_KEY.'),404
+ if not actual:return jsonify(error='No result found for this date. Import CSV or sync the archive.'),404
  report=[]
  for i,row in enumerate(rows):
-  hit=sorted(set(row)&set(actual));miss=sorted(set(actual)-set(row));report.append({'row':i+1,'hits':hit,'missed':miss,'count':len(hit),'extra':sorted(set(row)-set(actual))})
- return jsonify(actual=actual,report=report,best=max(x['count'] for x in report),unique_coverage=len(set(n for row in rows for n in row)&set(actual)),explanation='Misses reflect the model selecting other numbers. The draw is random: no causal explanation of misses is possible. Compare strategies on future unseen draws.' )
+  hit=sorted(set(row)&set(actual));report.append({'row':i+1,'hits':hit,'missed':sorted(set(actual)-set(row)),'count':len(hit),'extra':sorted(set(row)-set(actual))})
+ best=max(x['count'] for x in report);average=sum(x['count'] for x in report)/5;coverage=len(set(n for row in rows for n in row)&set(actual))
+ with connect() as c:c.execute('UPDATE predictions SET result_json=?,best=?,average=?,coverage=?,status=? WHERE id=?',(json.dumps(actual),best,average,coverage,'post_reveal' if r['status']=='post_reveal' else 'revealed',pid))
+ return jsonify(actual=actual,report=report,best=best,average=average,unique_coverage=coverage,mode=r['status'],explanation='Missed numbers were not selected by this strategy. Random draws have no known causal pattern. Only chronological unseen-draw testing can establish whether a strategy improves historical performance.')
+@app.get('/api/history')
+def audit_history():
+ with connect() as c:
+  preds=[dict(x) for x in c.execute('SELECT id,draw_date,created_at,attempt,status,draws_before,best,average,coverage FROM predictions ORDER BY created_at DESC LIMIT 150')]
+  runs=[dict(x) for x in c.execute('SELECT * FROM learning_runs ORDER BY created_at DESC LIMIT 30')]
+ for r in runs:
+  for k in ('baseline_json','challenger_json','old_weights_json','candidate_weights_json'):
+   r[k[:-5]]=json.loads(r.pop(k))
+ return jsonify(predictions=preds,learning_runs=runs)
+@app.get('/api/history.csv')
+def history_csv():
+ with connect() as c:rows=c.execute('SELECT id,draw_date,created_at,attempt,status,draws_before,best,average,coverage,rows_json,result_json,weights_json FROM predictions ORDER BY created_at').fetchall()
+ out=io.StringIO();writer=csv.writer(out);writer.writerow(['id','draw_date','created_at','attempt','status','draws_before','best','average','coverage','predictions','actual','weights'])
+ for r in rows:writer.writerow(list(r))
+ from flask import Response
+ return Response(out.getvalue(),mimetype='text/csv',headers={'Content-Disposition':'attachment; filename=zf_daily_prediction_audit.csv'})
 @app.post('/api/learn')
 def learn():
- h=history();dates=sorted(h);usable=dates[60:];usable=usable[-min(100,len(usable)):]
+ h=history();dates=sorted(h);usable=dates[60:][-30:]
  if len(usable)<20:return jsonify(error='Need at least 80 historical draws to evaluate learning.'),400
  base=weights();candidates=[base]
  for key in base:
-  for mult in (.5,1.5,2):
-   w=dict(base);w[key]*=mult;s=sum(w.values());candidates.append({k:v/s for k,v in w.items()})
- def evaluate(w,dates):
-  hits=0;maxhits=0
-  for d in dates:
-   rows=predict(d,h,w);actual=set(h[d]);hits+=sum(len(set(r)&actual) for r in rows);maxhits+=max(len(set(r)&actual) for r in rows)
-  return {'average_matches_per_row':round(hits/(5*len(dates)),4),'average_best_row':round(maxhits/len(dates),4),'draws':len(dates)}
- split=max(1,int(len(usable)*.7));train=usable[:split];test=usable[split:]
+  for mult in (.5,1.5):
+   w=dict(base);w[key]*=mult;total=sum(w.values());candidates.append({k:v/total for k,v in w.items()})
+ def evaluate(w,ds):
+  hits=best=0
+  for d in ds:
+   rows=predict(d,h,w);actual=set(h[d]);counts=[len(set(row)&actual) for row in rows];hits+=sum(counts);best+=max(counts)
+  return {'average_matches_per_row':round(hits/(5*len(ds)),4),'average_best_row':round(best/len(ds),4),'draws':len(ds)}
+ split=20;train=usable[:split];test=usable[split:]
  ranked=sorted(((evaluate(w,train)['average_matches_per_row'],w) for w in candidates),key=lambda x:x[0],reverse=True)
  champion=ranked[0][1];baseline=evaluate(base,test);challenger=evaluate(champion,test)
- promoted=challenger['average_matches_per_row']>baseline['average_matches_per_row']+.01
+ promoted=challenger['average_matches_per_row']>baseline['average_matches_per_row']+.05
+ reason='Challenger improved holdout average by more than 0.05 matches per row' if promoted else 'No meaningful holdout improvement; existing weights retained'
  if promoted:save(STATE,champion)
- return jsonify(promoted=promoted,baseline=baseline,challenger=challenger,training_draws=len(train),holdout_draws=len(test),weights=champion if promoted else base,note='Weights are changed only if the challenger beats the previous weights on untouched holdout dates. This does not prove future predictive power.')
+ with connect() as c:c.execute('INSERT INTO learning_runs VALUES (?,?,?,?,?,?,?,?,?,?)',(str(uuid.uuid4()),utcnow(),len(train),len(test),json.dumps(baseline),json.dumps(challenger),json.dumps(base),json.dumps(champion),int(promoted),reason))
+ return jsonify(promoted=promoted,baseline=baseline,challenger=challenger,training_draws=len(train),holdout_draws=len(test),weights=champion if promoted else base,reason=reason,note='This is a small historical holdout, not evidence of forecasting advantage. Repeated reuse of the same holdout causes overfitting.')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.environ.get('PORT',5000)))
