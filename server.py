@@ -3,6 +3,7 @@ from flask import Flask,request,jsonify,send_file
 app=Flask(__name__)
 DATA=os.path.join(os.environ.get('DATA_DIR','.'),'daily_history.json'); STATE=os.path.join(os.environ.get('DATA_DIR','.'),'learning.json'); os.makedirs(os.path.dirname(os.path.abspath(DATA)),exist_ok=True)
 DB=os.path.join(os.environ.get('DATA_DIR','.'),'learning_history.sqlite3')
+BUNDLED=os.path.join(os.path.dirname(os.path.abspath(__file__)),'za_daily.csv')
 def connect():
  c=sqlite3.connect(DB,timeout=15);c.row_factory=sqlite3.Row;c.execute('PRAGMA busy_timeout=15000');return c
 def initdb():
@@ -10,6 +11,11 @@ def initdb():
   c.execute('CREATE TABLE IF NOT EXISTS predictions (id TEXT PRIMARY KEY, draw_date TEXT, created_at TEXT, attempt INTEGER, rows_json TEXT, weights_json TEXT, status TEXT, draws_before INTEGER, result_json TEXT, best INTEGER, average REAL, coverage INTEGER)')
   c.execute('CREATE TABLE IF NOT EXISTS learning_runs (id TEXT PRIMARY KEY, created_at TEXT, training_count INTEGER, holdout_count INTEGER, baseline_json TEXT, challenger_json TEXT, old_weights_json TEXT, candidate_weights_json TEXT, promoted INTEGER, reason TEXT)')
 initdb()
+def bootstrap():
+ if os.path.exists(DATA) and load(DATA,{}):return
+ if os.path.exists(BUNDLED):
+  with open(BUNDLED,encoding='utf-8-sig',newline='') as f:parsed=parse(csv.DictReader(f))
+  if parsed:save(DATA,parsed)
 def utcnow():return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def rowdict(r):return dict(r) if r else None
 def load(path,default):
@@ -39,16 +45,21 @@ def parse(rows):
    if len(ns)==5 and len(set(ns))==5 and all(1<=n<=36 for n in ns):out[date]=sorted(ns)
   except (TypeError,ValueError):pass
  return out
-def history():return load(DATA,{})
+def history():
+ h=load(DATA,{})
+ if not h and os.path.exists(BUNDLED):
+  with open(BUNDLED,encoding='utf-8-sig',newline='') as f:h=parse(csv.DictReader(f))
+  if h:save(DATA,h)
+ return h
 def weights():return load(STATE,{'hot':.25,'recent':.2,'gap':.15,'cold':.15,'pair':.1,'long':.15})
 def predict(date,h=None,w=None,attempt=0):
  h=h or history();w=w or weights(); dates=sorted(d for d in h if d<date);hist=[h[d] for d in dates]
  if len(hist)<30:raise ValueError('At least 30 earlier Daily Lotto draws are required')
  recent=hist[-30:];mid=hist[-90:];long=hist[-365:];cnt=lambda seq:collections.Counter(n for row in seq for n in row)
  c30,c90,c365=cnt(recent),cnt(mid),cnt(long);scores={};last={n:next((i for i,row in enumerate(reversed(hist)) if n in row),len(hist)) for n in range(1,37)}
- pairs=collections.Counter(tuple(sorted((a,b))) for row in mid for a in row for b in row if a<b)
+ pairdegree=collections.Counter(n for row in mid for n in row); pairdegree={n:pairdegree[n]*4 for n in range(1,37)}
  for n in range(1,37):
-  vals={'hot':c90[n]/max(1,len(mid)),'recent':c30[n]/30,'gap':min(last[n],50)/50,'cold':1-c90[n]/max(1,len(mid)),'long':c365[n]/max(1,len(long)),'pair':sum(v for (a,b),v in pairs.items() if n in (a,b))/max(1,len(mid)*10)}
+  vals={'hot':c90[n]/max(1,len(mid)),'recent':c30[n]/30,'gap':min(last[n],50)/50,'cold':1-c90[n]/max(1,len(mid)),'long':c365[n]/max(1,len(long)),'pair':pairdegree[n]/max(1,len(mid)*10)}
   scores[n]=sum(w[k]*vals[k] for k in w)
  rng=random.Random(int(hashlib.sha256((date+json.dumps(w,sort_keys=True)+':'+str(attempt)).encode()).hexdigest()[:15],16));rows=[]
  for i in range(5):
@@ -143,6 +154,40 @@ def reveal():
  best=max(x['count'] for x in report);average=sum(x['count'] for x in report)/5;coverage=len(set(n for row in rows for n in row)&set(actual))
  with connect() as c:c.execute('UPDATE predictions SET result_json=?,best=?,average=?,coverage=?,status=? WHERE id=?',(json.dumps(actual),best,average,coverage,'post_reveal' if r['status']=='post_reveal' else 'revealed',pid))
  return jsonify(actual=actual,report=report,best=best,average=average,unique_coverage=coverage,mode=r['status'],explanation='Missed numbers were not selected by this strategy. Random draws have no known causal pattern. Only chronological unseen-draw testing can establish whether a strategy improves historical performance.')
+@app.get('/api/recurrence')
+def recurrence():
+ h=history();ds=sorted(h);four=collections.defaultdict(list);five=collections.defaultdict(list)
+ for i,d in enumerate(ds):
+  nums=tuple(sorted(h[d]));five[nums].append((i,d))
+  for group in __import__('itertools').combinations(nums,4):four[group].append((i,d))
+ def report(groups):
+  out=[]
+  for ns,occ in groups.items():
+   if len(occ)<2:continue
+   gaps=[(datetime.date.fromisoformat(b[1])-datetime.date.fromisoformat(a[1])).days for a,b in zip(occ,occ[1:])]
+   drawgaps=[b[0]-a[0] for a,b in zip(occ,occ[1:])]
+   out.append(dict(numbers=list(ns),count=len(occ),dates=[d for _,d in occ],days_between=gaps,draws_between=drawgaps))
+  return sorted(out,key=lambda x:(-x['count'],x['numbers']))
+ return jsonify(draws=len(ds),first=ds[0] if ds else None,last=ds[-1] if ds else None, repeated_four=report(four)[:100], repeated_five=report(five),four_groups_repeated=sum(len(v)>1 for v in four.values()),five_groups_repeated=sum(len(v)>1 for v in five.values()),note='Four-number groups are subsets of five-number results. Recurrence alone does not establish predictive power.')
+@app.post('/api/backtest')
+def backtest():
+ body=request.get_json(silent=True) or {};h=history();dates=sorted(h)
+ try:
+  count=max(1,min(500,int(body.get('count',500))))
+  # Use the last 500 eligible dates; each prediction is trained on strictly earlier results.
+  selected=dates[90:][-count:]
+  if len(selected)<20:raise ValueError('At least 110 historical draws required')
+  w=weights();dist=[0]*6;bestdist=[0]*6;total=0;coverage=0;randomtotal=0;randombest=0
+  for d in selected:
+   rows=predict(d,h,w);actual=set(h[d]);hits=[len(actual.intersection(row)) for row in rows]
+   for v in hits:dist[v]+=1;total+=v
+   bestdist[max(hits)]+=1;coverage+=len(actual.intersection(set().union(*map(set,rows))))
+   rng=random.Random(int(hashlib.sha256(('random-baseline:'+d).encode()).hexdigest()[:16],16))
+   rr=[rng.sample(range(1,37),6) for _ in range(5)]
+   rh=[len(actual.intersection(row)) for row in rr];randomtotal+=sum(rh);randombest+=max(rh)
+  n=len(selected)
+  return jsonify(draws=n,from_date=selected[0],to_date=selected[-1],distribution=dist,best_row_distribution=bestdist,average_matches_per_row=round(total/(5*n),4),average_best_row=round(sum(i*v for i,v in enumerate(bestdist))/n,4),average_unique_coverage=round(coverage/n,4),random_average_matches_per_row=round(randomtotal/(5*n),4),random_average_best_row=round(randombest/n,4),note='Chronological walk-forward test. Every prediction uses only earlier draws. Weights are current settings and may have been tuned on overlapping historical dates; reserve a separate untouched period for final validation.')
+ except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 @app.get('/api/history')
 def audit_history():
  with connect() as c:
@@ -161,8 +206,8 @@ def history_csv():
  return Response(out.getvalue(),mimetype='text/csv',headers={'Content-Disposition':'attachment; filename=zf_daily_prediction_audit.csv'})
 @app.post('/api/learn')
 def learn():
- h=history();dates=sorted(h);usable=dates[60:][-30:]
- if len(usable)<20:return jsonify(error='Need at least 80 historical draws to evaluate learning.'),400
+ h=history();dates=sorted(h);usable=dates[90:][-120:]
+ if len(usable)<40:return jsonify(error='Need at least 130 historical draws to evaluate learning.'),400
  base=weights();candidates=[base]
  for key in base:
   for mult in (.5,1.5):
@@ -172,7 +217,7 @@ def learn():
   for d in ds:
    rows=predict(d,h,w);actual=set(h[d]);counts=[len(set(row)&actual) for row in rows];hits+=sum(counts);best+=max(counts)
   return {'average_matches_per_row':round(hits/(5*len(ds)),4),'average_best_row':round(best/len(ds),4),'draws':len(ds)}
- split=20;train=usable[:split];test=usable[split:]
+ split=len(usable)//2;train=usable[:split];test=usable[split:]
  ranked=sorted(((evaluate(w,train)['average_matches_per_row'],w) for w in candidates),key=lambda x:x[0],reverse=True)
  champion=ranked[0][1];baseline=evaluate(base,test);challenger=evaluate(champion,test)
  promoted=challenger['average_matches_per_row']>baseline['average_matches_per_row']+.05
