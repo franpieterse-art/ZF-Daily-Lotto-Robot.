@@ -31,7 +31,7 @@ def parse(rows):
  return out
 def history():return load(DATA,{})
 def weights():return load(STATE,{'hot':.25,'recent':.2,'gap':.15,'cold':.15,'pair':.1,'long':.15})
-def predict(date,h=None,w=None):
+def predict(date,h=None,w=None,attempt=0):
  h=h or history();w=w or weights(); dates=sorted(d for d in h if d<date);hist=[h[d] for d in dates]
  if len(hist)<30:raise ValueError('At least 30 earlier Daily Lotto draws are required')
  recent=hist[-30:];mid=hist[-90:];long=hist[-365:];cnt=lambda seq:collections.Counter(n for row in seq for n in row)
@@ -40,7 +40,7 @@ def predict(date,h=None,w=None):
  for n in range(1,37):
   vals={'hot':c90[n]/max(1,len(mid)),'recent':c30[n]/30,'gap':min(last[n],50)/50,'cold':1-c90[n]/max(1,len(mid)),'long':c365[n]/max(1,len(long)),'pair':sum(v for (a,b),v in pairs.items() if n in (a,b))/max(1,len(mid)*10)}
   scores[n]=sum(w[k]*vals[k] for k in w)
- rng=random.Random(int(hashlib.sha256((date+json.dumps(w,sort_keys=True)).encode()).hexdigest()[:15],16));rows=[]
+ rng=random.Random(int(hashlib.sha256((date+json.dumps(w,sort_keys=True)+':'+str(attempt)).encode()).hexdigest()[:15],16));rows=[]
  for i in range(5):
   pool=list(range(1,37));chosen=[]
   while len(chosen)<6:
@@ -103,9 +103,10 @@ def imp():
  h=history();h.update(parsed);save(DATA,h);return jsonify(imported=len(parsed),total=len(h))
 @app.post('/api/predict')
 def pred():
- date=request.json.get('date','')
+ date=request.json.get('date','');attempt=int(request.json.get('attempt',0))
+ if not 0<=attempt<=10000:return jsonify(error='Invalid attempt'),400
  try:
-  datetime.date.fromisoformat(date);rows=predict(date);return jsonify(date=date,rows=rows,draws_before=sum(d<date for d in history()))
+  datetime.date.fromisoformat(date);rows=predict(date,attempt=attempt);return jsonify(date=date,rows=rows,attempt=attempt,draws_before=sum(d<date for d in history()),mode='blind' if attempt==0 else 'alternative blind candidate; valid only if generated before reveal')
  except Exception as e:return jsonify(error=str(e)),400
 @app.post('/api/reveal')
 def reveal():
