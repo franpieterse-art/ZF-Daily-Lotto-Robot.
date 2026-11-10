@@ -11,14 +11,23 @@ def save(path,obj):
 def parse(rows):
  out={}
  for r in rows:
-  game=str(r.get('game',r.get('game_type',''))).lower().replace(' ','').replace('_','')
-  if game!='dailylotto':continue
-  date=str(r.get('date',r.get('draw_date','')))[:10]
-  nums=r.get('numbers',r.get('winning_numbers',[]))
-  if isinstance(nums,str):nums=[int(x) for x in nums.replace('[','').replace(']','').replace(';',',').split(',') if x.strip().isdigit()]
+  r={str(k).strip().lower().replace(' ','_'):v for k,v in r.items() if k is not None}
+  game=str(r.get('game',r.get('game_type','daily lotto'))).lower().replace(' ','').replace('_','')
+  if game not in ('dailylotto',''):continue
+  date=str(r.get('date',r.get('draw_date',''))).strip()[:10]
+  try:datetime.date.fromisoformat(date)
+  except:continue
+  nums=r.get('numbers',r.get('winning_numbers',None))
+  if nums is None:
+   for keys in [('n1','n2','n3','n4','n5'),('number1','number2','number3','number4','number5'),('ball1','ball2','ball3','ball4','ball5')]:
+    if all(k in r for k in keys):nums=[r[k] for k in keys];break
+  if isinstance(nums,str):
+   import re
+   nums=re.findall(r'\d+',nums)
   try:
-   if len(nums)==5 and len(set(map(int,nums)))==5 and all(1<=int(n)<=36 for n in nums):out[date]=sorted(map(int,nums))
-  except:pass
+   ns=list(map(int,nums))
+   if len(ns)==5 and len(set(ns))==5 and all(1<=n<=36 for n in ns):out[date]=sorted(ns)
+  except (TypeError,ValueError):pass
  return out
 def history():return load(DATA,{})
 def weights():return load(STATE,{'hot':.25,'recent':.2,'gap':.15,'cold':.15,'pair':.1,'long':.15})
@@ -46,16 +55,14 @@ def status():
  h=history();return jsonify(draws=len(h),first=min(h) if h else None,last=max(h) if h else None,weights=weights())
 @app.post('/api/sync')
 def sync():
- url='https://bettip.co.za/api/lotto/draws.json'
- try:
-  req=urllib.request.Request(url,headers={'User-Agent':'ZF-Daily-Lotto-Research/1.0'});raw=json.load(urllib.request.urlopen(req,timeout=25));rows=raw if isinstance(raw,list) else next((raw[k] for k in ('draws','results','data') if isinstance(raw.get(k),list)),[])
-  parsed=parse(rows);h=history();h.update(parsed);save(DATA,h);return jsonify(imported=len(parsed),total=len(h))
- except Exception as e:return jsonify(error=str(e),hint='Use CSV import if the public feed is unavailable.'),400
+ return jsonify(error='The previous public archive URL is unavailable (404). Please import a Daily Lotto CSV below. No results have been imported or changed.',hint='Use CSV with date and five numbers. Sync will require a verified provider API endpoint.'),503
 @app.post('/api/import')
 def imp():
  f=request.files.get('file')
  if not f:return jsonify(error='Choose CSV'),400
- rows=list(csv.DictReader(io.StringIO(f.read().decode('utf-8-sig'))));parsed=parse(rows);h=history();h.update(parsed);save(DATA,h);return jsonify(imported=len(parsed),total=len(h))
+ rows=list(csv.DictReader(io.StringIO(f.read().decode('utf-8-sig'))));parsed=parse(rows);
+ if not parsed:return jsonify(error='No valid Daily Lotto draws found. Use date,n1,n2,n3,n4,n5 or date,numbers. Dates must be YYYY-MM-DD.'),400
+ h=history();h.update(parsed);save(DATA,h);return jsonify(imported=len(parsed),total=len(h))
 @app.post('/api/predict')
 def pred():
  date=request.json.get('date','')
