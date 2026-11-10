@@ -1,7 +1,7 @@
-import os,csv,io,json,random,hashlib,urllib.request,datetime,collections,math
+import os,csv,io,json,random,hashlib,urllib.request,urllib.parse,urllib.error,datetime,collections,math,re,time
 from flask import Flask,request,jsonify,send_file
 app=Flask(__name__)
-DATA='daily_history.json'; STATE='learning.json'
+DATA=os.path.join(os.environ.get('DATA_DIR','.'),'daily_history.json'); STATE=os.path.join(os.environ.get('DATA_DIR','.'),'learning.json'); os.makedirs(os.path.dirname(os.path.abspath(DATA)),exist_ok=True)
 def load(path,default):
  try:
   with open(path) as f:return json.load(f)
@@ -52,10 +52,48 @@ def predict(date,h=None,w=None):
 def index():return send_file('index.html')
 @app.get('/api/status')
 def status():
- h=history();return jsonify(draws=len(h),first=min(h) if h else None,last=max(h) if h else None,weights=weights())
+ h=history();return jsonify(draws=len(h),first=min(h) if h else None,last=max(h) if h else None,weights=weights(),api_configured=bool(os.environ.get('RESULTSZA_API_KEY')))
+def fetch_draw(date):
+ key=os.environ.get('RESULTSZA_API_KEY','').strip()
+ if not key:raise ValueError('RESULTSZA_API_KEY is not configured in Render Environment. Add your own key from resultsza.co.za.')
+ params=urllib.parse.urlencode({'api_key':key,'date':date})
+ req=urllib.request.Request('https://resultsza.co.za/api/get_daily_lotto_results?'+params,headers={'User-Agent':'ZF-Daily-Lotto-Research/2.0','Accept':'application/json'})
+ try:
+  with urllib.request.urlopen(req,timeout=12) as resp:obj=json.load(resp)
+ except urllib.error.HTTPError as e:
+  if e.code==404:return None
+  if e.code in (401,403):raise ValueError('ResultsZA rejected the API key or access (HTTP %s).'%e.code)
+  if e.code==429:raise ValueError('ResultsZA API rate limit reached (429). Try a smaller date range later.')
+  raise ValueError('ResultsZA returned HTTP %s'%e.code)
+ except (urllib.error.URLError,TimeoutError) as e:raise ValueError('Could not contact ResultsZA: '+str(e))
+ if obj.get('status')=='error':raise ValueError(str(obj.get('message','Provider returned an error')))
+ rows=obj.get('results',[])
+ if isinstance(rows,dict):rows=[rows]
+ parsed=parse([dict(r,game='Daily Lotto') for r in rows if isinstance(r,dict)])
+ return parsed.get(date)
+
 @app.post('/api/sync')
 def sync():
- return jsonify(error='The previous public archive URL is unavailable (404). Please import a Daily Lotto CSV below. No results have been imported or changed.',hint='Use CSV with date and five numbers. Sync will require a verified provider API endpoint.'),503
+ body=request.get_json(silent=True) or {}
+ try:
+  start=datetime.date.fromisoformat(body.get('start','2026-10-01'))
+  end=datetime.date.fromisoformat(body.get('end',datetime.date.today().isoformat()))
+  if end<start:raise ValueError('End date must not be before start date.')
+  if end>datetime.date.today():raise ValueError('Cannot sync future dates.')
+  if (end-start).days>60:raise ValueError('Sync at most 61 dates at a time to limit API usage. Run again for the next period.')
+  if not os.environ.get('RESULTSZA_API_KEY'):raise ValueError('Add RESULTSZA_API_KEY in Render Environment before automatic sync.')
+  h=history();new=0;checked=0;skipped=0;errors=[]
+  for offset in range((end-start).days+1):
+   d=(start+datetime.timedelta(days=offset)).isoformat()
+   if d in h:skipped+=1;continue
+   try:
+    nums=fetch_draw(d);checked+=1
+    if nums:h[d]=nums;new+=1;save(DATA,h)
+   except ValueError as e:
+    errors.append({'date':d,'error':str(e)});break
+  return jsonify(imported=new,total=len(h),checked=checked,skipped=skipped,errors=errors,first=min(h) if h else None,last=max(h) if h else None)
+ except ValueError as e:return jsonify(error=str(e)),400
+
 @app.post('/api/import')
 def imp():
  f=request.files.get('file')
@@ -72,19 +110,17 @@ def pred():
 @app.post('/api/reveal')
 def reveal():
  d=request.json['date'];rows=request.json['rows'];h=history();actual=h.get(d)
- if not actual:
-  key=os.environ.get('RESULTSZA_API_KEY')
-  if key:
-   try:
-    url='https://resultsza.co.za/api/get_daily_lotto_results?api_key='+key+'&date='+d
-    obj=json.load(urllib.request.urlopen(url,timeout=15));actual=parse([dict(r,game='Daily Lotto') for r in obj.get('results',[])]).get(d)
-    if actual:h[d]=actual;save(DATA,h)
-   except:pass
+ if len(rows)!=5 or any(len(r)!=6 or len(set(r))!=6 or any(not isinstance(n,int) or not 1<=n<=36 for n in r) for r in rows):return jsonify(error='Invalid prediction rows'),400
+ if not actual and os.environ.get('RESULTSZA_API_KEY'):
+  try:
+   actual=fetch_draw(d)
+   if actual:h[d]=actual;save(DATA,h)
+  except ValueError as e:return jsonify(error=str(e)),502
  if not actual:return jsonify(error='No verified result for this date in the archive. Sync or import results, or configure RESULTSZA_API_KEY.'),404
  report=[]
  for i,row in enumerate(rows):
   hit=sorted(set(row)&set(actual));miss=sorted(set(actual)-set(row));report.append({'row':i+1,'hits':hit,'missed':miss,'count':len(hit),'extra':sorted(set(row)-set(actual))})
- return jsonify(actual=actual,report=report,best=max(x['count'] for x in report),unique_coverage=len(set(n for row in rows for n in row)&set(actual)),explanation='The missing numbers were not selected by this historical scoring model. Frequency and gaps describe the past; they do not establish why a random draw occurred.' )
+ return jsonify(actual=actual,report=report,best=max(x['count'] for x in report),unique_coverage=len(set(n for row in rows for n in row)&set(actual)),explanation='Misses reflect the model selecting other numbers. The draw is random: no causal explanation of misses is possible. Compare strategies on future unseen draws.' )
 @app.post('/api/learn')
 def learn():
  h=history();dates=sorted(h);usable=dates[60:];usable=usable[-min(100,len(usable)):]
